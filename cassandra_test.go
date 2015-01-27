@@ -1490,3 +1490,34 @@ func TestKeyspaceMetadata(t *testing.T) {
 	}
 }
 
+func TestQueryInfoCache(t *testing.T) {
+	session := createSession(t)
+	defer session.Close()
+
+	actual, err := session.queryInfo("SELECT release_version, host_id FROM system.local WHERE key = ?")
+	if err != nil {
+		t.Fatalf("failed to get query info with err: %v", err)
+	}
+	if actual == nil {
+		t.Fatal("expected query info but was nil")
+	}
+	if len(actual.Args) != 1 {
+		t.Errorf("expected 1 query args but was %d", len(actual.Args))
+	}
+
+	// again
+	actual, err = session.queryInfo("SELECT release_version, host_id FROM system.local WHERE key = ?")
+	if err != nil {
+		t.Fatalf("failed to get query info with err: %v", err)
+	}
+	if actual == nil {
+		t.Fatal("expected query info but was nil")
+	}
+	if len(actual.Args) != 1 {
+		t.Errorf("expected 1 query args but was %d", len(actual.Args))
+	}
+
+	if session.queryInfoCache.lru.Len() != 1 {
+		t.Errorf("expected 1 query info cached, but was %d", session.queryInfoCache.lru.Len())
+	}
+}

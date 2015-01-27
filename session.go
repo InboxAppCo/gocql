@@ -12,6 +12,8 @@ import (
 	"sync"
 	"time"
 	"unicode"
+
+	"github.com/golang/groupcache/lru"
 )
 
 // Session is the interface used by users to interact with the database.
@@ -28,6 +30,7 @@ type Session struct {
 	cons            Consistency
 	pageSize        int
 	prefetch        float64
+	queryInfoCache  queryInfoLRU
 	schemaDescriber *schemaDescriber
 	trace           Tracer
 	mu              sync.RWMutex
@@ -40,7 +43,12 @@ type Session struct {
 
 // NewSession wraps an existing Node.
 func NewSession(p ConnectionPool, c ClusterConfig) *Session {
-	return &Session{Pool: p, cons: Quorum, prefetch: 0.25, cfg: c}
+	session := &Session{Pool: p, cons: Quorum, prefetch: 0.25, cfg: c}
+
+	// create the query info cache
+	session.queryInfoCache.lru = lru.New(c.MaxQueryInfoCached)
+
+	return session
 }
 
 // SetConsistency sets the default consistency level for this session. This
@@ -173,6 +181,48 @@ func (s *Session) KeyspaceMetadata() (*KeyspaceMetadata, error) {
 	}
 	s.mu.Unlock()
 	return s.schemaDescriber.GetSchema()
+}
+
+// determine the QueryInfo for a given statement
+func (s *Session) queryInfo(stmt string) (*QueryInfo, error) {
+	// check the query info cache
+	s.queryInfoCache.mu.Lock()
+	queryInfoCacheKey := s.cfg.Keyspace + stmt
+	// the cache uses the same mechanic as the prepared statement cache
+	// to avoid concurrent goroutines from preparing the query on multiple
+	// different connections on a cache miss
+	cachedValue, cached := s.queryInfoCache.lru.Get(queryInfoCacheKey)
+	if cached {
+		flight := cachedValue.(*inflightPrepare)
+		s.queryInfoCache.mu.Unlock()
+		flight.wg.Wait()
+		return flight.info, flight.err
+	}
+
+	flight := new(inflightPrepare)
+	flight.wg.Add(1)
+	s.queryInfoCache.lru.Add(queryInfoCacheKey, flight)
+	s.queryInfoCache.mu.Unlock()
+
+	// get any connection
+	conn := s.Pool.Pick(nil)
+
+	if conn == nil {
+		flight.err = ErrNoConnections
+	} else {
+		// prepare the statement to get the query info
+		queryInfo, err := conn.prepareStatement(stmt, s.trace)
+		if err != nil {
+			flight.err = err
+		} else {
+			flight.info = queryInfo
+		}
+	}
+
+	// let other goroutines know this flight is done
+	flight.wg.Done()
+
+	return flight.info, flight.err
 }
 
 // ExecuteBatch executes a batch operation and returns nil if successful
@@ -598,6 +648,23 @@ type ColumnInfo struct {
 	Table    string
 	Name     string
 	TypeInfo *TypeInfo
+}
+
+// query info LRU cache
+type queryInfoLRU struct {
+	lru *lru.Cache
+	mu  sync.Mutex
+}
+
+//Max adjusts the maximum size of the cache and cleans up the oldest records if
+//the new max is lower than the previous value. Not concurrency safe.
+func (q *queryInfoLRU) Max(max int) {
+	q.mu.Lock()
+	for q.lru.Len() > max {
+		q.lru.RemoveOldest()
+	}
+	q.lru.MaxEntries = max
+	q.mu.Unlock()
 }
 
 // Tracer is the interface implemented by query tracers. Tracers have the
