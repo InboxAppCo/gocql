@@ -5,6 +5,8 @@
 package gocql
 
 import (
+	"bytes"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -225,6 +227,54 @@ func (s *Session) queryInfo(stmt string) (*QueryInfo, error) {
 	return flight.info, flight.err
 }
 
+func (s *Session) routingKeyIndexes(stmt string) []int {
+	// TODO add caching of the routing key indexes
+
+	queryInfo, err := s.queryInfo(stmt)
+	if err != nil {
+		// unable to get the query info
+		return nil
+	}
+	if len(queryInfo.Args) == 0 {
+		// no arguments, no routing key
+		return nil
+	}
+
+	table := queryInfo.Args[0].Table
+	keyspaceMetadata, err := s.KeyspaceMetadata()
+	if err != nil {
+		// unable to get the keyspace metadata
+		return nil
+	}
+	tableMetadata := keyspaceMetadata.Tables[table]
+	if tableMetadata == nil {
+		// unable to find the table metadata
+		return nil
+	}
+
+	partitionKey := tableMetadata.PartitionKey
+	routingKeyIndexes := make([]int, len(partitionKey))
+	for i, keyColumn := range partitionKey {
+		routingKeyIndexes[i] = -1
+		// find the column in the query info
+		for j, boundColumn := range queryInfo.Args {
+			if keyColumn.Name == boundColumn.Name {
+				// there may be many such columns, pick the first
+				routingKeyIndexes[i] = j
+				break
+			}
+		}
+
+		if routingKeyIndexes[i] == -1 {
+			// missing a routing key column mapping
+			return nil
+		}
+	}
+
+	// cache this result
+	return routingKeyIndexes
+}
+
 // ExecuteBatch executes a batch operation and returns nil if successful
 // otherwise an error is returned describing the failure.
 func (s *Session) ExecuteBatch(batch *Batch) error {
@@ -274,6 +324,7 @@ type Query struct {
 	values       []interface{}
 	cons         Consistency
 	pageSize     int
+	routingKey   []byte
 	pageState    []byte
 	prefetch     float64
 	trace        Tracer
@@ -325,6 +376,63 @@ func (q *Query) Trace(trace Tracer) *Query {
 func (q *Query) PageSize(n int) *Query {
 	q.pageSize = n
 	return q
+}
+
+// RoutingKey sets the routing key to use when a token aware connection
+// pool is used to optimize the routing of this query.
+func (q *Query) RoutingKey(routingKey []byte) *Query {
+	q.routingKey = routingKey
+	return q
+}
+
+// GetRoutingKey gets the routing key to use for routing this query. If
+// a routing key has not been explicitly set, then the routing key will
+// be constructed if possible using the keyspace's schema and the query
+// info for this query statement.
+func (q *Query) GetRoutingKey() []byte {
+	if q.routingKey != nil {
+		return q.routingKey
+	}
+
+	// try to determine the routing key
+	routingKeyIndexes := q.session.routingKeyIndexes(q.stmt)
+	if routingKeyIndexes == nil {
+		return nil
+	}
+
+	queryInfo, err := q.session.queryInfo(q.stmt)
+	if err != nil {
+		return nil
+	}
+
+	if len(routingKeyIndexes) == 1 {
+		// single column routing key
+		routingKey, err := Marshal(
+			queryInfo.Args[routingKeyIndexes[0]].TypeInfo,
+			q.values[routingKeyIndexes[0]],
+		)
+		if err != nil {
+			return nil
+		}
+		return routingKey
+	}
+
+	// composite routing key
+	buf := &bytes.Buffer{}
+	for _, routingKeyIndex := range routingKeyIndexes {
+		encoded, err := Marshal(
+			queryInfo.Args[routingKeyIndex].TypeInfo,
+			q.values[routingKeyIndex],
+		)
+		if err != nil {
+			return nil
+		}
+		binary.Write(buf, binary.BigEndian, int16(len(encoded)))
+		buf.Write(encoded)
+		buf.WriteByte(0x00)
+	}
+	routingKey := buf.Bytes()
+	return routingKey
 }
 
 func (q *Query) shouldPrepare() bool {
