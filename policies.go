@@ -4,6 +4,12 @@
 //This file will be the future home for more policies
 package gocql
 
+import (
+	"log"
+	"sync"
+	"sync/atomic"
+)
+
 //RetryableQuery is an interface that represents a query or batch statement that
 //exposes the correct functions for the retry policy logic to evaluate correctly.
 type RetryableQuery interface {
@@ -41,4 +47,133 @@ type SimpleRetryPolicy struct {
 // than the NumRetries defined in the policy.
 func (s *SimpleRetryPolicy) Attempt(q RetryableQuery) bool {
 	return q.Attempts() <= s.NumRetries
+}
+
+// HostSelectionPolicy is an interface for selecting an appropriate
+// the most appropriate host to execute a given query.
+type HostSelectionPolicy interface {
+	SetHosts(hosts []*HostInfo, partitioner string)
+	Pick(*Query) *HostInfo
+}
+
+// a simple round-robin host selection policy
+type roundRobinHostPolicy struct {
+	hosts []*HostInfo
+	pos   uint32
+	mu    sync.RWMutex
+}
+
+func NewRoundRobinHostPolicy() HostSelectionPolicy {
+	return &roundRobinHostPolicy{hosts: []*HostInfo{}}
+}
+
+func (r *roundRobinHostPolicy) SetHosts(hosts []*HostInfo, partitioner string) {
+	r.mu.Lock()
+	r.hosts = hosts
+	r.mu.Unlock()
+}
+
+func (r *roundRobinHostPolicy) Pick(qry *Query) *HostInfo {
+	pos := atomic.AddUint32(&r.pos, 1)
+	var host *HostInfo
+	r.mu.RLock()
+	if len(r.hosts) > 0 {
+		host = r.hosts[pos%uint32(len(r.hosts))]
+	}
+	r.mu.RUnlock()
+	return host
+}
+
+// a host selection policy which select a host based on awareness of how
+// a routing key maps to a token and from that token to a host in the
+// token ring
+type tokenAwareHostPolicy struct {
+	mu        sync.RWMutex
+	tokenRing *TokenRing
+	fallback  HostSelectionPolicy
+}
+
+func NewTokenAwareHostPolicy(fallback HostSelectionPolicy) HostSelectionPolicy {
+	return &tokenAwareHostPolicy{fallback: fallback}
+}
+
+func (t *tokenAwareHostPolicy) SetHosts(hosts []*HostInfo, partitioner string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	// always update the fallback
+	t.fallback.SetHosts(hosts, partitioner)
+
+	if partitioner == "" {
+		// partitioner not yet set
+		return
+	}
+
+	// create a new token ring
+	tokenRing, err := NewTokenRing(partitioner, hosts)
+	if err != nil {
+		log.Printf("Unable to update the token ring due to error: %s", err)
+		return
+	}
+
+	// replace the token ring
+	t.tokenRing = tokenRing
+}
+
+func (t *tokenAwareHostPolicy) Pick(qry *Query) *HostInfo {
+	if qry == nil {
+		return t.fallback.Pick(qry)
+	}
+
+	routingKey := qry.GetRoutingKey()
+
+	if routingKey == nil {
+		return t.fallback.Pick(qry)
+	}
+
+	var host *HostInfo
+
+	t.mu.RLock()
+	if t.tokenRing != nil {
+		host = t.tokenRing.GetHostForPartitionKey(routingKey)
+	}
+	t.mu.RUnlock()
+
+	if host == nil {
+		return t.fallback.Pick(qry)
+	}
+
+	return host
+}
+
+type ConnSelectionPolicy interface {
+	SetConns(conns []*Conn)
+	Pick() *Conn
+}
+
+type roundRobinConnPolicy struct {
+	conns []*Conn
+	pos   uint32
+	mu    sync.RWMutex
+}
+
+func NewRoundRobinConnPolicy() ConnSelectionPolicy {
+	return &roundRobinConnPolicy{conns: []*Conn{}}
+}
+
+func (r *roundRobinConnPolicy) SetConns(conns []*Conn) {
+	r.mu.Lock()
+	r.conns = conns
+	r.mu.Unlock()
+}
+
+func (r *roundRobinConnPolicy) Pick() *Conn {
+	pos := atomic.AddUint32(&r.pos, 1)
+	var conn *Conn
+	r.mu.RLock()
+	if len(r.conns) > 0 {
+		conn = r.conns[pos%uint32(len(r.conns))]
+	}
+	r.mu.RUnlock()
+	return conn
 }

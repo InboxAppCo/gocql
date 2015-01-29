@@ -58,7 +58,7 @@ type ClusterConfig struct {
 	Authenticator      Authenticator // authenticator (default: nil)
 	RetryPolicy        RetryPolicy   // Default retry policy to use for queries (default: 0)
 	SocketKeepalive    time.Duration // The keepalive period to use, enabled if > 0 (default: 0)
-	ConnPoolType       NewPoolFunc   // The function used to create the connection pool for the session (default: NewSimplePool)
+	ConnPoolType       NewPoolFunc   // The function used to create the connection pool for the session (default: NewRoundRobinConnPool)
 	DiscoverHosts      bool          // If set, gocql will attempt to automatically discover other members of the Cassandra cluster (default: false)
 	MaxPreparedStmts   int           // Sets the maximum cache size for prepared statements globally for gocql (default: 1000)
 	MaxQueryInfoCached int           // Sets the maximum cache size for query info about statements for each session (default: 1000)
@@ -77,7 +77,7 @@ func NewCluster(hosts ...string) *ClusterConfig {
 		NumConns:           2,
 		NumStreams:         128,
 		Consistency:        Quorum,
-		ConnPoolType:       NewSimplePool,
+		ConnPoolType:       NewRoundRobinConnPool,
 		DiscoverHosts:      false,
 		MaxPreparedStmts:   1000,
 		MaxQueryInfoCached: 1000,

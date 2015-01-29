@@ -9,7 +9,7 @@ import (
 func TestSessionAPI(t *testing.T) {
 
 	cfg := ClusterConfig{}
-	pool := NewSimplePool(&cfg)
+	pool := NewRoundRobinConnPool(&cfg)
 
 	s := NewSession(pool, cfg)
 
@@ -151,7 +151,7 @@ func TestBatchBasicAPI(t *testing.T) {
 
 	cfg := ClusterConfig{}
 	cfg.RetryPolicy = &SimpleRetryPolicy{NumRetries: 2}
-	pool := NewSimplePool(&cfg)
+	pool := NewRoundRobinConnPool(&cfg)
 
 	s := NewSession(pool, cfg)
 	b := s.NewBatch(UnloggedBatch)
