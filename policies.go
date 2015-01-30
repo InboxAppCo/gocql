@@ -49,22 +49,27 @@ func (s *SimpleRetryPolicy) Attempt(q RetryableQuery) bool {
 	return q.Attempts() <= s.NumRetries
 }
 
-// HostSelectionPolicy is an interface for selecting an appropriate
-// the most appropriate host to execute a given query.
+//HostSelectionPolicy is an interface for selecting
+//the most appropriate host to execute a given query.
 type HostSelectionPolicy interface {
+	//SetHosts notifies this policy of the current hosts in the cluster
 	SetHosts(hosts []*HostInfo, partitioner string)
-	Pick(*Query) *HostInfo
+	//Pick returns an iteration function over selected hosts
+	Pick(*Query) NextHost
 }
 
-// a simple round-robin host selection policy
+//NextHost is an iteration function over picked hosts
+type NextHost func() *HostInfo
+
+//NewRoundRobinHostPolicy is a round-robin load balancing policy
+func NewRoundRobinHostPolicy() HostSelectionPolicy {
+	return &roundRobinHostPolicy{hosts: []*HostInfo{}}
+}
+
 type roundRobinHostPolicy struct {
 	hosts []*HostInfo
 	pos   uint32
 	mu    sync.RWMutex
-}
-
-func NewRoundRobinHostPolicy() HostSelectionPolicy {
-	return &roundRobinHostPolicy{hosts: []*HostInfo{}}
 }
 
 func (r *roundRobinHostPolicy) SetHosts(hosts []*HostInfo, partitioner string) {
@@ -73,28 +78,30 @@ func (r *roundRobinHostPolicy) SetHosts(hosts []*HostInfo, partitioner string) {
 	r.mu.Unlock()
 }
 
-func (r *roundRobinHostPolicy) Pick(qry *Query) *HostInfo {
+func (r *roundRobinHostPolicy) Pick(qry *Query) NextHost {
 	pos := atomic.AddUint32(&r.pos, 1)
-	var host *HostInfo
-	r.mu.RLock()
-	if len(r.hosts) > 0 {
-		host = r.hosts[pos%uint32(len(r.hosts))]
+	var i uint32 = 0
+	return func() *HostInfo {
+		var host *HostInfo
+		r.mu.RLock()
+		if len(r.hosts) > 0 && int(i) < len(r.hosts) {
+			host = r.hosts[(pos+i)%uint32(len(r.hosts))]
+			i++
+		}
+		r.mu.RUnlock()
+		return host
 	}
-	r.mu.RUnlock()
-	return host
 }
 
-// a host selection policy which select a host based on awareness of how
-// a routing key maps to a token and from that token to a host in the
-// token ring
+//NewTokenAwareHostPolicy is a token aware host selection policy
+func NewTokenAwareHostPolicy(fallback HostSelectionPolicy) HostSelectionPolicy {
+	return &tokenAwareHostPolicy{fallback: fallback}
+}
+
 type tokenAwareHostPolicy struct {
 	mu        sync.RWMutex
 	tokenRing *TokenRing
 	fallback  HostSelectionPolicy
-}
-
-func NewTokenAwareHostPolicy(fallback HostSelectionPolicy) HostSelectionPolicy {
-	return &tokenAwareHostPolicy{fallback: fallback}
 }
 
 func (t *tokenAwareHostPolicy) SetHosts(hosts []*HostInfo, partitioner string) {
@@ -120,7 +127,7 @@ func (t *tokenAwareHostPolicy) SetHosts(hosts []*HostInfo, partitioner string) {
 	t.tokenRing = tokenRing
 }
 
-func (t *tokenAwareHostPolicy) Pick(qry *Query) *HostInfo {
+func (t *tokenAwareHostPolicy) Pick(qry *Query) NextHost {
 	if qry == nil {
 		return t.fallback.Pick(qry)
 	}
@@ -143,12 +150,32 @@ func (t *tokenAwareHostPolicy) Pick(qry *Query) *HostInfo {
 		return t.fallback.Pick(qry)
 	}
 
-	return host
+	var hostReturned bool = false
+	var once sync.Once
+	var fallbackIter NextHost
+	return func() *HostInfo {
+		if !hostReturned {
+			hostReturned = true
+			return host
+		}
+
+		// fallback
+		once.Do(func() { fallbackIter = t.fallback.Pick(qry) })
+
+		fallbackHost := fallbackIter()
+		if fallbackHost == host {
+			fallbackHost = fallbackIter()
+		}
+
+		return fallbackHost
+	}
 }
 
+//ConnSelectionPolicy is an interface for selecting an
+//appropriate connection for executing a query
 type ConnSelectionPolicy interface {
 	SetConns(conns []*Conn)
-	Pick() *Conn
+	Pick(*Query) *Conn
 }
 
 type roundRobinConnPolicy struct {
@@ -167,7 +194,7 @@ func (r *roundRobinConnPolicy) SetConns(conns []*Conn) {
 	r.mu.Unlock()
 }
 
-func (r *roundRobinConnPolicy) Pick() *Conn {
+func (r *roundRobinConnPolicy) Pick(qry *Query) *Conn {
 	pos := atomic.AddUint32(&r.pos, 1)
 	var conn *Conn
 	r.mu.RLock()

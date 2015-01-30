@@ -1,3 +1,7 @@
+// Copyright (c) 2015 The gocql Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
 package gocql
 
 import "testing"
@@ -13,14 +17,26 @@ func TestRoundRobinHostPolicy(t *testing.T) {
 	policy.SetHosts(hosts, "")
 
 	// the first host selected is actually at [1], but this is ok for RR
-	if actual := policy.Pick(nil); actual != hosts[1] {
+	iter := policy.Pick(nil)
+	if actual := iter(); actual != hosts[1] {
 		t.Errorf("Expected hosts[0] but was hosts[%s]", actual.HostId)
 	}
-	if actual := policy.Pick(nil); actual != hosts[0] {
+	if actual := iter(); actual != hosts[0] {
 		t.Errorf("Expected hosts[1] but was hosts[%s]", actual.HostId)
 	}
-	if actual := policy.Pick(nil); actual != hosts[1] {
+	iter = policy.Pick(nil)
+	if actual := iter(); actual != hosts[0] {
 		t.Errorf("Expected hosts[0] but was hosts[%s]", actual.HostId)
+	}
+	if actual := iter(); actual != hosts[1] {
+		t.Errorf("Expected hosts[1] but was hosts[%s]", actual.HostId)
+	}
+	iter = policy.Pick(nil)
+	if actual := iter(); actual != hosts[1] {
+		t.Errorf("Expected hosts[0] but was hosts[%s]", actual.HostId)
+	}
+	if actual := iter(); actual != hosts[0] {
+		t.Errorf("Expected hosts[1] but was hosts[%s]", actual.HostId)
 	}
 }
 
@@ -39,7 +55,7 @@ func TestTokenAwareHostPolicy(t *testing.T) {
 	query := &Query{}
 	query.RoutingKey([]byte("30"))
 
-	if actual := policy.Pick(query); actual != hosts[2] {
+	if actual := policy.Pick(query)(); actual != hosts[2] {
 		t.Errorf("Expected hosts[2] but was hosts[%s]", actual.HostId)
 	}
 }
@@ -57,13 +73,13 @@ func TestRoundRobinConnPolicy(t *testing.T) {
 	policy.SetConns(conn)
 
 	// the first conn selected is actually at [1], but this is ok for RR
-	if actual := policy.Pick(); actual != conn1 {
+	if actual := policy.Pick(nil); actual != conn1 {
 		t.Error("Expected conn1")
 	}
-	if actual := policy.Pick(); actual != conn0 {
+	if actual := policy.Pick(nil); actual != conn0 {
 		t.Error("Expected conn0")
 	}
-	if actual := policy.Pick(); actual != conn1 {
+	if actual := policy.Pick(nil); actual != conn1 {
 		t.Error("Expected conn1")
 	}
 }

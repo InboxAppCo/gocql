@@ -2,6 +2,7 @@ package gocql
 
 import (
 	"log"
+	"net"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -387,7 +388,7 @@ func NewRoundRobinConnPool(cfg *ClusterConfig) ConnectionPool {
 	return newPolicyConnPool(
 		cfg,
 		NewRoundRobinHostPolicy(),
-		NewRoundRobinConnPolicy(),
+		NewRoundRobinConnPolicy,
 	)
 }
 
@@ -398,7 +399,7 @@ func NewTokenAwareConnPool(cfg *ClusterConfig) ConnectionPool {
 	return newPolicyConnPool(
 		cfg,
 		NewTokenAwareHostPolicy(NewRoundRobinHostPolicy()),
-		NewRoundRobinConnPolicy(),
+		NewRoundRobinConnPolicy,
 	)
 }
 
@@ -410,14 +411,14 @@ type policyConnPool struct {
 
 	mu            sync.RWMutex
 	hostPolicy    HostSelectionPolicy
-	connPolicy    ConnSelectionPolicy
+	connPolicy    func() ConnSelectionPolicy
 	hostConnPools map[string]*hostConnPool
 }
 
 func newPolicyConnPool(
 	cfg *ClusterConfig,
 	hostPolicy HostSelectionPolicy,
-	connPolicy ConnSelectionPolicy,
+	connPolicy func() ConnSelectionPolicy,
 ) ConnectionPool {
 	// create the pool
 	pool := &policyConnPool{
@@ -470,7 +471,7 @@ func (p *policyConnPool) SetHosts(hosts []*HostInfo, partitioner string) {
 				p.numConns,
 				p.connCfg,
 				p.keyspace,
-				p.connPolicy,
+				p.connPolicy(),
 			)
 			p.hostConnPools[host.Peer] = pool
 		} else {
@@ -503,13 +504,18 @@ func (p *policyConnPool) Size() int {
 }
 
 func (p *policyConnPool) Pick(qry *Query) *Conn {
-	host := p.hostPolicy.Pick(qry)
-	if host == nil {
-		return nil
-	}
+	nextHost := p.hostPolicy.Pick(qry)
 
 	p.mu.RLock()
-	conn := p.hostConnPools[host.Peer].Pick()
+	var host *HostInfo
+	var conn *Conn
+	for conn == nil {
+		host = nextHost()
+		if host == nil {
+			break
+		}
+		conn = p.hostConnPools[host.Peer].Pick(qry)
+	}
 	p.mu.RUnlock()
 	return conn
 }
@@ -573,7 +579,7 @@ func newHostConnPool(
 	return pool
 }
 
-func (pool *hostConnPool) Pick() *Conn {
+func (pool *hostConnPool) Pick(qry *Query) *Conn {
 	pool.mu.Lock()
 	if pool.closed {
 		pool.mu.Unlock()
@@ -588,11 +594,7 @@ func (pool *hostConnPool) Pick() *Conn {
 		pool.fill()
 	}
 
-	conn := pool.policy.Pick()
-
-	if conn == nil {
-		go pool.fill()
-	}
+	conn := pool.policy.Pick(qry)
 
 	return conn
 }
@@ -621,7 +623,7 @@ func (pool *hostConnPool) Close() {
 func (pool *hostConnPool) fill() {
 	pool.mu.Lock()
 	// avoid filling a closed pool, or concurrent filling
-	if pool.closed && pool.filling {
+	if pool.closed || pool.filling {
 		pool.mu.Unlock()
 		return
 	}
@@ -645,10 +647,16 @@ func (pool *hostConnPool) fill() {
 	// fill only the first connection synchronously
 	if startCount == 0 {
 		err := pool.connect()
-		if err != nil {
+		if opErr, ok := err.(*net.OpError); ok && opErr.Op == "read" {
+			// connection refused
+			// these are typical during a node outage so avoid log spam.
+		} else if err != nil {
 			log.Printf("error: failed to connect to %s - %v", pool.addr, err)
+		}
+
+		if err != nil {
 			// probably unreachable host
-			pool.filling = false
+			go pool.stopFilling()
 			return
 		}
 
@@ -660,7 +668,10 @@ func (pool *hostConnPool) fill() {
 	go func() {
 		for fillCount > 0 {
 			err := pool.connect()
-			if err != nil {
+			if opErr, ok := err.(*net.OpError); ok && opErr.Op == "read" {
+				// connection refused
+				// these are typical during a node outage so avoid log spam.
+			} else if err != nil {
 				log.Printf("error: failed to connect to %s - %v", pool.addr, err)
 				// TODO add backoff
 			}
@@ -670,8 +681,15 @@ func (pool *hostConnPool) fill() {
 		}
 
 		// mark the end of filling
-		pool.filling = false
+		pool.stopFilling()
 	}()
+}
+
+func (pool *hostConnPool) stopFilling() {
+	time.Sleep(100 * time.Millisecond)
+	pool.mu.Lock()
+	pool.filling = false
+	pool.mu.Unlock()
 }
 
 func (pool *hostConnPool) connect() error {
