@@ -5,7 +5,11 @@
 package gocql
 
 import (
+	"errors"
+	"fmt"
 	"log"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 )
@@ -241,4 +245,324 @@ func (r *roundRobinConnPolicy) Pick(qry *Query) *Conn {
 	}
 	r.mu.RUnlock()
 	return conn
+}
+
+type ReplicationPolicy interface {
+	GetReplicas(
+		tokens []token,
+		hosts []*HostInfo,
+	) (replicas [][]*HostInfo)
+}
+
+func newReplicationPolicy(
+	strategyClass string,
+	options map[string]string,
+) (ReplicationPolicy, error) {
+	if strings.HasSuffix(strategyClass, "SimpleStrategy") {
+		return newSimpleReplicationPolicy(options)
+	}
+	if strings.HasSuffix(strategyClass, "NetworkTopologyStrategy") {
+		return newNetworkTopologyReplicationPolicy(options)
+	}
+	return nil, fmt.Errorf(
+		"Unsupported replication strategy '%s'",
+		strategyClass,
+	)
+}
+
+type simpleReplicationPolicy struct {
+	replicationFactor int
+}
+
+func newSimpleReplicationPolicy(
+	options map[string]string,
+) (ReplicationPolicy, error) {
+	// get the replication factor
+	replicationFactorStr, found := options["replication_factor"]
+	if !found {
+		return nil, errors.New(
+			"replication_factor option must be supplied for SimpleStrategy " +
+				"replication strategy",
+		)
+	}
+
+	// parse the replication factor
+	replicationFactor, err := strconv.ParseInt(replicationFactorStr, 10, 32)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"replication_factor setting '%s' could not be parsed due to an error: %v",
+			replicationFactorStr,
+			err,
+		)
+	}
+
+	return &simpleReplicationPolicy{int(replicationFactor)}, nil
+}
+
+func (s *simpleReplicationPolicy) GetReplicas(
+	tokens []token,
+	hosts []*HostInfo,
+) (replicas [][]*HostInfo) {
+	ringSize := len(tokens)
+	replicationFactor := s.replicationFactor
+	if replicationFactor > ringSize {
+		// replication factor cannot be greater than the ring size
+		replicationFactor = ringSize
+	}
+	replicas = make([][]*HostInfo, ringSize)
+
+	// find the replicas for every token
+	for i := 0; i < ringSize; i++ {
+		replicas[i] = make([]*HostInfo, replicationFactor)
+		// the first replica is the token owner
+		replicas[i][0] = hosts[i]
+
+		// the other replicas are successive hosts around the ring.
+	find_replicas:
+		for j := 1; j < replicationFactor; j++ {
+			candidate := hosts[(i+j)%ringSize]
+
+			// hosts can own successive tokens so check against the existing
+			// replicas found
+			for k := 0; k < j; k++ {
+				if replicas[i][k] == candidate {
+					// not unique
+					continue find_replicas
+				}
+			}
+
+			// this candidate is a replica
+			replicas[i][j] = candidate
+		}
+	}
+
+	return replicas
+}
+
+type networkTopologyReplicationStrategy struct {
+	replicationFactors map[string]int
+}
+
+func newNetworkTopologyReplicationPolicy(
+	options map[string]string,
+) (ReplicationPolicy, error) {
+	// each option is a replication factor
+	replicationFactors := map[string]int{}
+	for optionName, optionValue := range options {
+		replicationFactor, err := strconv.ParseInt(optionValue, 10, 32)
+		if err != nil {
+			return nil, fmt.Errorf(
+				"replication factor setting '%s': '%s' could not be parsed due to an error: %v",
+				optionName,
+				optionValue,
+				err,
+			)
+		}
+
+		replicationFactors[optionName] = int(replicationFactor)
+	}
+
+	return &networkTopologyReplicationStrategy{replicationFactors}, nil
+}
+
+type dcReplicaVisitInfo struct {
+	replicationFactor int
+	racks             []string
+	rackCount         int
+
+	replicaCount     int
+	visitedRackCount int
+	visitedRacks     []string
+
+	skipped []*HostInfo
+}
+
+func (d *dcReplicaVisitInfo) done() bool {
+	return d.replicaCount >= d.replicationFactor
+}
+
+func (d *dcReplicaVisitInfo) reset() {
+	d.replicaCount = 0
+	d.visitedRacks = d.visitedRacks[:0]
+	d.visitedRackCount = 0
+}
+
+func hostSetAppend(
+	set []*HostInfo,
+	host *HostInfo,
+) (resultSet []*HostInfo, added bool) {
+	for i := range set {
+		if host == set[i] {
+			return set, false
+		}
+	}
+
+	return append(set, host), true
+}
+
+func (n *networkTopologyReplicationStrategy) GetReplicas(
+	tokens []token,
+	hosts []*HostInfo,
+) (replicas [][]*HostInfo) {
+
+	ringSize := len(tokens)
+	replicas = make([][]*HostInfo, ringSize)
+
+	// prepare the dc information for these hosts
+	dcInfos := map[string]*dcReplicaVisitInfo{}
+create_dc_info:
+	for _, host := range hosts {
+		dc := host.DataCenter
+		if dc == "" {
+			continue
+		}
+
+		replicationFactor, found := n.replicationFactors[dc]
+		if !found {
+			// not included in strategy
+			continue
+		}
+
+		dcInfo, found := dcInfos[dc]
+		if !found {
+			dcInfo = &dcReplicaVisitInfo{
+				replicationFactor: replicationFactor,
+				racks:             make([]string, 0, ringSize),
+				skipped:           make([]*HostInfo, 0, ringSize),
+			}
+			dcInfos[dc] = dcInfo
+		}
+
+		rack := host.Rack
+		if rack == "" {
+			continue
+		}
+
+		// check if the rack is already known
+		for i := range dcInfo.racks {
+			if rack == dcInfo.racks[i] {
+				// already in the set
+				continue create_dc_info
+			}
+		}
+
+		dcInfo.racks = append(dcInfo.racks, rack)
+		dcInfo.rackCount++
+	}
+
+	// determine the replicas for all tokens
+	for i := 0; i < ringSize; i++ {
+		// reset the infos
+		for _, dcInfo := range dcInfos {
+			dcInfo.reset()
+		}
+
+		// size the array capacity assuming all hosts are added worst case
+		replicas[i] = make([]*HostInfo, 0, ringSize)
+
+		for j := 0; j < ringSize; j++ {
+			// determine if done
+			done := true
+			for _, dcInfo := range dcInfos {
+				if !dcInfo.done() {
+					done = false
+					break
+				}
+			}
+			if done {
+				break
+			}
+
+			candidate := hosts[(i+j)%ringSize]
+
+			dc := candidate.DataCenter
+
+			if dc == "" {
+				// not included in the strategy
+				continue
+			}
+
+			dcInfo, found := dcInfos[dc]
+			if !found {
+				// not included in the strategy
+				continue
+			}
+
+			if dcInfo.done() {
+				// all replicas from this dc for this token are fulfilled
+				continue
+			}
+
+			var added bool
+
+			// check the rack
+			rack := candidate.Rack
+			if rack == "" {
+				// include this candidate since it has no rack
+				replicas[i], added = hostSetAppend(replicas[i], candidate)
+				if added {
+					dcInfo.replicaCount++
+				}
+				continue
+			}
+
+			// check if all racks visited in this dc
+			if dcInfo.visitedRackCount == dcInfo.rackCount {
+				// include this candidate since all racks are visited already
+				replicas[i], added = hostSetAppend(replicas[i], candidate)
+				if added {
+					dcInfo.replicaCount++
+				}
+				continue
+			}
+
+			// not all racks have been visited;
+			// check if this rack has been visited already
+			alreadyVisited := false
+			for i := range dcInfo.visitedRacks {
+				if rack == dcInfo.visitedRacks[i] {
+					alreadyVisited = true
+					break
+				}
+			}
+			if alreadyVisited {
+				// skip until after all racks visited
+				dcInfo.skipped, _ = hostSetAppend(dcInfo.skipped, candidate)
+				continue
+			}
+
+			// include this candidate, rack not visited
+			replicas[i], added = hostSetAppend(replicas[i], candidate)
+			if added {
+				dcInfo.replicaCount++
+			}
+
+			// visit the rack
+			dcInfo.visitedRacks = append(dcInfo.visitedRacks, rack)
+			dcInfo.visitedRackCount++
+
+			// check if all racks have been visited, if so, add the skipped hosts
+			if dcInfo.visitedRackCount != dcInfo.rackCount {
+				// not all racks visited, keep looking for hosts in non-visited racks
+				continue
+			}
+
+			// add from skipped hosts now that all racks are visited
+			// TODO use copy
+			for _, host := range dcInfo.skipped {
+				if dcInfo.done() {
+					break
+				}
+
+				replicas[i], added = hostSetAppend(replicas[i], host)
+				if added {
+					dcInfo.replicaCount++
+				}
+			}
+		}
+	}
+
+	// TODO compact the replicas in memory?
+
+	return replicas
 }
