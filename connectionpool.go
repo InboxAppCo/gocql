@@ -14,6 +14,7 @@ import (
 	"math/rand"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -472,14 +473,15 @@ func NewTokenAwareConnPool(cfg *ClusterConfig) (ConnectionPool, error) {
 }
 
 type policyConnPool struct {
-	port     int
-	numConns int
-	connCfg  ConnConfig
-	keyspace string
+	port       int
+	numConns   int
+	connCfg    ConnConfig
+	keyspace   string
+	hostPolicy HostSelectionPolicy
+	connPolicy func() ConnSelectionPolicy
 
+	// protection for hostConnPools
 	mu            sync.RWMutex
-	hostPolicy    HostSelectionPolicy
-	connPolicy    func() ConnSelectionPolicy
 	hostConnPools map[string]*hostConnPool
 }
 
@@ -541,9 +543,7 @@ func (p *policyConnPool) SetHosts(hosts []HostInfo) {
 		toRemove[addr] = struct{}{}
 	}
 
-	// TODO connect to hosts in parallel, but wait for pools to be
-	// created before returning
-
+	added := make([]*hostConnPool, 0, len(hosts))
 	for i := range hosts {
 		pool, exists := p.hostConnPools[hosts[i].Peer]
 		if !exists {
@@ -556,6 +556,7 @@ func (p *policyConnPool) SetHosts(hosts []HostInfo) {
 				p.keyspace,
 				p.connPolicy(),
 			)
+			added = append(added, pool)
 			p.hostConnPools[hosts[i].Peer] = pool
 		} else {
 			// still have this host, so don't remove it
@@ -569,10 +570,23 @@ func (p *policyConnPool) SetHosts(hosts []HostInfo) {
 		pool.Close()
 	}
 
+	p.mu.Unlock()
+
 	// update the policy
 	p.hostPolicy.SetHosts(hosts)
 
-	p.mu.Unlock()
+	// force the new host connection pools to start filling
+	// this ensures that SetHosts has tried to connect at least once
+	// to new hosts before returning (an expectation of NewPolicyConnPool)
+	wg := sync.WaitGroup{}
+	for _, pool := range added {
+		wg.Add(1)
+		go func(pool *hostConnPool) {
+			pool.fill()
+			wg.Done()
+		}(pool)
+	}
+	wg.Wait()
 }
 
 func (p *policyConnPool) SetPartitioner(partitioner string) {
@@ -601,19 +615,24 @@ func (p *policyConnPool) Pick(qry *Query) *Conn {
 		if host == nil {
 			break
 		}
-		conn = p.hostConnPools[host.Peer].Pick(qry)
+
+		hostPool, found := p.hostConnPools[host.Peer]
+		if !found {
+			break
+		}
+
+		conn = hostPool.Pick(qry)
 	}
 	p.mu.RUnlock()
 	return conn
 }
 
 func (p *policyConnPool) Close() {
-	p.mu.Lock()
-
 	// remove the hosts from the policy
 	p.hostPolicy.SetHosts([]HostInfo{})
 
 	// close the pools
+	p.mu.Lock()
 	for addr, pool := range p.hostConnPools {
 		delete(p.hostConnPools, addr)
 		pool.Close()
@@ -631,11 +650,13 @@ type hostConnPool struct {
 	connCfg  ConnConfig
 	keyspace string
 	policy   ConnSelectionPolicy
-	// protection for conns, closed, filling
-	mu      sync.RWMutex
-	conns   []*Conn
-	closed  bool
-	filling bool
+	// protection for conns, closed
+	mu     sync.RWMutex
+	conns  []*Conn
+	closed bool
+	// a value of 0 indicating not filling or 1 indicating filling
+	// to be used with atomic package operations as a semaphore
+	filling int32
 }
 
 func newHostConnPool(
@@ -656,12 +677,9 @@ func newHostConnPool(
 		keyspace: keyspace,
 		policy:   policy,
 		conns:    make([]*Conn, 0, size),
-		filling:  false,
+		filling:  0,
 		closed:   false,
 	}
-
-	// fill the pool with the initial connections before returning
-	pool.fill()
 
 	return pool
 }
@@ -710,9 +728,14 @@ func (pool *hostConnPool) Close() {
 
 // Fill the connection pool
 func (pool *hostConnPool) fill() {
+	if !atomic.CompareAndSwapInt32(&pool.filling, 0, 1) {
+		// already filling
+		return
+	}
+
 	pool.mu.RLock()
 	// avoid filling a closed pool, or concurrent filling
-	if pool.closed || pool.filling {
+	if pool.closed {
 		pool.mu.RUnlock()
 		return
 	}
@@ -720,32 +743,13 @@ func (pool *hostConnPool) fill() {
 	// determine the filling work to be done
 	startCount := len(pool.conns)
 	fillCount := pool.size - startCount
+	pool.mu.RUnlock()
 
 	// avoid filling a full (or overfull) pool
 	if fillCount <= 0 {
-		pool.mu.RUnlock()
 		return
 	}
 
-	// switch from read to write lock
-	pool.mu.RUnlock()
-	pool.mu.Lock()
-
-	// double check everything since the lock was released
-	startCount = len(pool.conns)
-	fillCount = pool.size - startCount
-	if pool.closed || pool.filling || fillCount <= 0 {
-		// looks like another goroutine already beat this
-		// goroutine to the filling
-		pool.mu.Unlock()
-		return
-	}
-
-	// ok fill the pool
-	pool.filling = true
-
-	// allow others to access the pool while filling
-	pool.mu.Unlock()
 	// only this goroutine should make calls to fill/empty the pool at this
 	// point until after this routine or its subordinates calls
 	// fillingStopped
@@ -809,9 +813,7 @@ func (pool *hostConnPool) fillingStopped() {
 	// to fill the pool for the host to recover
 	time.Sleep(time.Duration(rand.Int31n(100)+31) * time.Millisecond)
 
-	pool.mu.Lock()
-	pool.filling = false
-	pool.mu.Unlock()
+	atomic.StoreInt32(&pool.filling, 0)
 }
 
 // create a new connection to the host and add it to the pool
